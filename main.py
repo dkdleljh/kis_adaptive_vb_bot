@@ -27,6 +27,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional
 
+from reporting import ReportManager, TradeRecord
+
 from dotenv import load_dotenv
 
 from data_handler import KISDataHandler
@@ -82,16 +84,68 @@ async def run() -> None:
     load_dotenv(project_root / ".env")
 
     level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=getattr(logging, level, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+
+    # ---- logging (console + file) ----
+    # 운영 시 'nohup 로그'만 남기면 찾기/요약이 어렵습니다.
+    # logs/에 날짜별 파일을 추가로 남깁니다.
+    log_dir = project_root / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    day = now_kst().date().isoformat()
+    file_path = log_dir / f"pairbot_{day}.log"
+
     log = logging.getLogger("adaptive_vb")
+    log.setLevel(getattr(logging, level, logging.INFO))
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    # 중복 핸들러 방지
+    if not log.handlers:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        fh = logging.FileHandler(file_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        log.addHandler(sh)
+        log.addHandler(fh)
+
+    log.propagate = False
 
     capital = float(os.getenv("CAPITAL_KRW", "10000000"))
     poll_interval = float(os.getenv("PRICE_POLL_INTERVAL_SEC", "1.0"))
 
+    # ---- report manager ----
+    report = ReportManager(project_root=project_root, run_ts=now_kst())
+    report.write_meta(
+        universe={
+            "KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV},
+            "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV},
+        },
+        config={
+            "capital_krw": capital,
+            "poll_interval_sec": poll_interval,
+            "log_level": level,
+            "live_gate": {
+                "KIS_LIVE_ENABLED": os.getenv("KIS_LIVE_ENABLED", "0"),
+                "KIS_LIVE_CONFIRM": os.getenv("KIS_LIVE_CONFIRM", "NO"),
+                "KIS_KILL_SWITCH": os.getenv("KIS_KILL_SWITCH", "1"),
+                "stop_flag": str((project_root / "STOP_TRADING.flag").exists()),
+            },
+        },
+    )
+
     # 휴장일/주말 자동 스킵
     today = now_kst().date()
     if not is_market_open(today):
-        log.info("Market closed today (%s): %s. Exiting.", today.isoformat(), get_holiday_name(today))
+        msg = f"Market closed today ({today.isoformat()}): {get_holiday_name(today)}. Exiting."
+        log.info(msg)
+        report.event("market_closed", date=today.isoformat(), holiday=get_holiday_name(today))
+        report.finalize(
+            summary={
+                "date": today.isoformat(),
+                "market_open": False,
+                "universe": {"KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV}, "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV}},
+                "groups": {},
+                "notes": [msg],
+            }
+        )
         return
 
     data = KISDataHandler(log)
@@ -144,6 +198,16 @@ async def run() -> None:
         inv_above = open_inv > float(c["ma5_inv"])
         if lev_above == inv_above:
             g.decision = GroupDecision(False, None, f"SKIP contradiction lev_above={lev_above} inv_above={inv_above}")
+            log.info("[%s] %s", g.name, g.decision.reason)
+            report.event(
+                "decision_skip",
+                group=g.name,
+                reason=g.decision.reason,
+                open_lev=float(open_lev),
+                open_inv=float(open_inv),
+                ma5_lev=float(c["ma5_lev"]),
+                ma5_inv=float(c["ma5_inv"]),
+            )
             continue
 
         if lev_above:
@@ -174,6 +238,21 @@ async def run() -> None:
         g.chosen_open = open_chosen
         g.atr20 = atr20
         log.info("[%s] decision=%s", g.name, decision)
+
+        # 리포트 기록(결정 + 주요 입력)
+        try:
+            report.decision(
+                g.name,
+                decision,
+                open_lev=float(open_lev),
+                open_inv=float(open_inv),
+                ma5_lev=float(c["ma5_lev"]),
+                ma5_inv=float(c["ma5_inv"]),
+                atr20=float(atr20),
+                noise20avg=float(noise),
+            )
+        except Exception as e:
+            log.warning("report.decision failed: %s", e)
 
     # 감시 대상(승인된 종목만)
     symbols = [g.decision.chosen_symbol for g in groups.values() if g.decision and g.decision.approved and g.decision.chosen_symbol]
@@ -218,6 +297,20 @@ async def run() -> None:
 
                     res = execu.buy_market(sym, qty)
                     log.info("[%s] BUY %s qty=%s px=%.2f target=%.2f => %s", g.name, sym, qty, px, g.decision.target_price, res)
+                    report.trade(
+                        TradeRecord(
+                            ts=now_kst().isoformat(timespec="seconds"),
+                            group=g.name,
+                            symbol=sym,
+                            side="BUY",
+                            qty=int(qty),
+                            px_assumed=float(px),
+                            reason="breakout>=target",
+                            order_no=getattr(res, "order_no", None),
+                            ok=bool(getattr(res, "ok", False)),
+                            msg=str(getattr(res, "msg", "")),
+                        )
+                    )
                     if res.ok:
                         g.entered = True
                         g.position = risk.init_position(symbol=sym, qty=qty, entry_price=px, atr20=g.atr20)
@@ -231,6 +324,20 @@ async def run() -> None:
                 if px <= g.position.trailing_stop:
                     res = execu.sell_market(sym, g.position.qty)
                     log.info("[%s] STOP SELL %s qty=%s px=%.2f stop=%.2f => %s", g.name, sym, g.position.qty, px, g.position.trailing_stop, res)
+                    report.trade(
+                        TradeRecord(
+                            ts=now_kst().isoformat(timespec="seconds"),
+                            group=g.name,
+                            symbol=sym,
+                            side="SELL",
+                            qty=int(g.position.qty),
+                            px_assumed=float(px),
+                            reason=f"trailing_stop<=px (stop={g.position.trailing_stop:.2f})",
+                            order_no=getattr(res, "order_no", None),
+                            ok=bool(getattr(res, "ok", False)),
+                            msg=str(getattr(res, "msg", "")),
+                        )
+                    )
                     # 어떤 결과든 포지션 종료 처리(재시도는 별도 운영)
                     g.position = None
 
@@ -239,7 +346,46 @@ async def run() -> None:
         if g.position:
             res = execu.sell_market(g.position.symbol, g.position.qty)
             log.info("[%s] FORCE SELL %s qty=%s => %s", g.name, g.position.symbol, g.position.qty, res)
+            report.trade(
+                TradeRecord(
+                    ts=now_kst().isoformat(timespec="seconds"),
+                    group=g.name,
+                    symbol=g.position.symbol,
+                    side="SELL",
+                    qty=int(g.position.qty),
+                    px_assumed=float("nan"),
+                    reason="force_exit_15_15",
+                    order_no=getattr(res, "order_no", None),
+                    ok=bool(getattr(res, "ok", False)),
+                    msg=str(getattr(res, "msg", "")),
+                )
+            )
             g.position = None
+
+    # 리포트 마무리
+    try:
+        summary_groups = {}
+        for g in groups.values():
+            summary_groups[g.name] = {
+                "decision": getattr(g.decision, "reason", None) if g.decision else None,
+                "chosen": getattr(g.decision, "chosen_symbol", None) if g.decision else None,
+                "target": float(getattr(g.decision, "target_price", 0.0)) if (g.decision and getattr(g.decision, "target_price", None) is not None) else None,
+                "entered": bool(g.entered),
+                "exit": None,
+            }
+
+        report.finalize(
+            summary={
+                "date": now_kst().date().isoformat(),
+                "market_open": True,
+                "universe": {"KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV}, "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV}},
+                "groups": summary_groups,
+                "notes": ["체결가는 주문 직전 관측가격(px)을 가정값으로 기록합니다.", "정확한 정산은 별도 체결조회/증권사 체결내역과 대조하세요."],
+            }
+        )
+        log.info("report written: %s", report.out_dir)
+    except Exception as e:
+        log.warning("report.finalize failed: %s", e)
 
 
 if __name__ == "__main__":
