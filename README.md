@@ -1,75 +1,97 @@
-# 페어봇 (KIS Adaptive Volatility Breakout KR ETF Pair)
+# 페어봇 (PairBot) — KIS Adaptive Volatility Breakout (KR ETF Pair)
 
-> ⚠️ 실전용 자동매매 봇입니다. 충분한 모의/소액 검증 후 사용하세요.
->
-> - 기본 안전장치(kis_orb_vwap_bot과 동일):
->   - `KIS_LIVE_ENABLED=1` AND `KIS_LIVE_CONFIRM=YES` AND `KIS_KILL_SWITCH=0`
->   - 그리고 `STOP_TRADING.flag`가 **없어야** 주문이 나갑니다.
-> - 이 프로젝트는 KIS OpenAPI 호출/웹소켓 포맷이 계정/상품/환경에 따라 달라질 수 있어, **TR_ID/필드명은 반드시 최종 점검**이 필요합니다.
+KIS OpenAPI로 **KODEX ETF 4종목**을 대상으로
+"적응형 변동성 돌파(Adaptive Volatility Breakout)"를 실행하는 자동매매 봇입니다.
 
-## 1) 폴더 구조
+- 유니버스(고정)
+  - KOSPI: 122630(레버) vs 252670(인버스2X)
+  - KOSDAQ: 233740(코스닥150레버) vs 251340(코스닥150인버스)
 
-- `data_handler.py` : 토큰/일봉 조회 + MA5/ATR20/Noise20 계산
-- `strategy_engine.py` : 모순 필터 + 동적 K + 목표가 산출
-- `risk_manager.py` : 변동성 타겟팅 수량 + 샹들리에 트레일링 스탑
-- `execution_handler.py` : REST 주문 + 웹소켓(가능하면) 현재가 스트림
-- `main.py` : 08:50 갱신 → 09:00~13:00 진입 → 15:15 전량청산
+> ⚠️ 면책
+> - 투자 조언이 아닙니다. 손실 책임은 사용자에게 있습니다.
+> - 실거래 전 모의/소액으로 충분히 검증하세요.
 
-## 2) 실행 준비
+---
 
-### 2.1 가상환경
+## 문서
+- **사용설명서(초보자용)**: `사용설명서.md`
+
+---
+
+## 빠른 시작(3분)
 
 ```bash
 cd ~/Desktop/kis_adaptive_vb_bot
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 2.2 환경변수(.env)
-
-`.env.example`을 복사해 `.env`를 만들고 값을 채우세요.
-
-```bash
+bash scripts/bootstrap.sh
 cp .env.example .env
-```
-
-- 실전 안전장치: 실주문을 허용하려면 `KIS_LIVE_ENABLED=1`, `KIS_LIVE_CONFIRM=YES`, `KIS_KILL_SWITCH=0`
-- 실주문을 막고 싶으면 `touch STOP_TRADING.flag`
-
-## 3) 실행
-
-### (권장) KIS 봇처럼 스크립트로 바로 실행
-
-```bash
+nano .env
 bash scripts/run_bot.sh
 ```
 
-- 로그: `logs/nohup_adaptive_vb.log`
-- 중지:
+로그:
+```bash
+tail -n 200 logs/nohup_adaptive_vb.log
+```
 
+중지:
 ```bash
 bash scripts/stop_bot.sh
 ```
 
-### 직접 실행
+---
 
+## 실전 주문 안전장치(중요)
+
+주문이 나가려면 아래가 **모두** 필요합니다.
+
+- `.env`:
+  - `KIS_LIVE_ENABLED=1`
+  - `KIS_LIVE_CONFIRM=YES`
+  - `KIS_KILL_SWITCH=0`
+- 그리고 `STOP_TRADING.flag` 파일이 **없어야** 합니다.
+
+주문 차단(권장):
 ```bash
-source venv/bin/activate
-python main.py
+touch STOP_TRADING.flag
 ```
 
-## 4) 유니버스(고정)
+---
 
-- KOSPI pair
-  - KODEX 레버리지(122630)
-  - KODEX 200선물인버스2X(252670)
-- KOSDAQ pair
-  - KODEX 코스닥150레버리지(233740)
-  - KODEX 코스닥150선물인버스(251340)
+## 운영 타임테이블(KST)
 
-## 5) 운영 메모
+- 08:50 데이터 갱신(일봉/지표)
+- 09:00 모순 필터 + 목표가 산출
+- 09:00~13:00 목표가 돌파 1회 진입
+- 진입 후 트레일링 스탑 감시
+- 15:15 전량 강제청산
 
-- 본 구현은 **웹소켓이 불안정/미구성**일 때를 대비해, 웹소켓 연결 실패 시 **REST 현재가 폴링**으로 자동 폴백합니다.
-- WebSocket approval key는 kis 봇처럼 `oauth2/Approval`로 자동 발급/레이트리밋 보호를 적용합니다.
-- REST 폴링은 초당 호출 제한(EGW00201)을 맞추기 위해 기본 `PRICE_POLL_INTERVAL_SEC=1.0`로 둡니다.
+---
+
+## WebSocket(선택)
+
+실전 WS 도메인(문서 H0STCNT0 기준):
+- `ws://ops.koreainvestment.com:21000`
+
+환경변수:
+```env
+KIS_WS_URL=ws://ops.koreainvestment.com:21000
+```
+
+점검:
+```bash
+bash scripts/ws_smoke_test.sh
+```
+
+---
+
+## 폴더 구조
+
+- `main.py` : 스케줄/오케스트레이션
+- `data_handler.py` : 일봉/시가/지표 계산
+- `strategy_engine.py` : 모순 필터 + 동적 K + 목표가
+- `risk_manager.py` : 1% 리스크 수량 + 트레일링 스탑
+- `execution_handler.py` : 주문/시세(WS→REST 폴백)
+- `kis_auth.py` : tokenP/Approval/hashkey + 레이트리밋/backoff
+- `kis_ws_marketdata.py` : WS 메시지 파싱(체결가)
+- `utils_holiday.py` : 주말/휴장일 스킵
+- `scripts/` : bootstrap/run/stop/ws_smoke
