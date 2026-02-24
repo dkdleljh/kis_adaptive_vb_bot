@@ -41,6 +41,7 @@ class TradeRecord:
     order_no: Optional[str] = None
     ok: bool = True
     msg: str = ""
+    pnl_krw: Optional[float] = None  # SELL 체결 시점에 (SELL-BUY)*qty 추정(가정 체결가 기반)
 
 
 class ReportManager:
@@ -59,6 +60,10 @@ class ReportManager:
         self.trades_path = self.out_dir / "trades.csv"
 
         self._trades: List[TradeRecord] = []
+        # (group,symbol)별 "열린 포지션"의 가정 체결가를 기억해 SELL 시 PnL을 추정합니다.
+        # BUY가 여러 번 나가는 구조로 확장하면 FIFO/평단이 필요하지만,
+        # 현재 전략(그룹당 1회 진입)에서는 단일 BUY → 단일 SELL 가정이 안전합니다.
+        self._open_pos: Dict[tuple[str, str], Dict[str, Any]] = {}
 
     # ---------- low-level writers ----------
     def _write_jsonl(self, obj: Dict[str, Any]) -> None:
@@ -104,6 +109,29 @@ class ReportManager:
         )
 
     def trade(self, rec: TradeRecord) -> None:
+        """거래 기록.
+
+        - ok=True인 BUY는 open position으로 등록
+        - ok=True인 SELL은 open position과 매칭해 PnL 추정치를 rec.pnl_krw에 기록
+        """
+        if rec.ok:
+            key = (rec.group, rec.symbol)
+            if rec.side.upper() == "BUY":
+                self._open_pos[key] = {
+                    "qty": int(rec.qty),
+                    "buy_px": float(rec.px_assumed),
+                    "buy_ts": rec.ts,
+                }
+            elif rec.side.upper() == "SELL":
+                pos = self._open_pos.get(key)
+                if pos and pos.get("qty"):
+                    buy_px = float(pos.get("buy_px") or 0.0)
+                    qty = int(rec.qty)
+                    # 가정 체결가 기반 실현손익(수수료/세금/슬리피지 제외)
+                    rec.pnl_krw = (float(rec.px_assumed) - buy_px) * qty
+                    # 청산 완료 처리
+                    self._open_pos.pop(key, None)
+
         self._trades.append(rec)
         self.event("trade", **asdict(rec))
 
@@ -112,7 +140,7 @@ class ReportManager:
 
     # ---------- finalize ----------
     def _write_trades_csv(self) -> None:
-        header = "ts,group,symbol,side,qty,px_assumed,reason,order_no,ok,msg\n"
+        header = "ts,group,symbol,side,qty,px_assumed,reason,order_no,ok,msg,pnl_krw\n"
         lines = [header]
         for t in self._trades:
             # csv minimal escaping
@@ -136,6 +164,7 @@ class ReportManager:
                         esc(t.order_no or ""),
                         esc("1" if t.ok else "0"),
                         esc(t.msg),
+                        esc("" if t.pnl_krw is None else f"{t.pnl_krw:.0f}"),
                     ]
                 )
                 + "\n"
@@ -179,16 +208,42 @@ class ReportManager:
                 lines.append(f"- exit: {info.get('exit')}\n")
             lines.append("")
 
+        # ---- stats ----
+        approved = 0
+        skipped = 0
+        entered = 0
+        groups: Dict[str, Any] = summary.get("groups") or {}
+        for _, info in groups.items():
+            dec = info.get("decision")
+            if isinstance(dec, str) and dec.startswith("SKIP"):
+                skipped += 1
+            elif dec:
+                approved += 1
+            if info.get("entered"):
+                entered += 1
+
+        sells = [t for t in self._trades if t.side.upper() == "SELL" and t.ok]
+        realized = sum([t.pnl_krw for t in sells if t.pnl_krw is not None])
+        win = len([t for t in sells if (t.pnl_krw or 0) > 0])
+        lose = len([t for t in sells if (t.pnl_krw or 0) < 0])
+
+        lines.append("\n## 요약 통계\n")
+        lines.append(f"- 그룹 수: {len(groups)} (승인 {approved}, 스킵 {skipped})")
+        lines.append(f"- 진입: {entered}건")
+        lines.append(f"- 청산(SELL, OK): {len(sells)}건 (승 {win} / 패 {lose})")
+        lines.append(f"- 실현손익 추정(가정 체결가, 수수료/세금 제외): {realized:,.0f} KRW")
+
         lines.append("\n## 거래(가정 체결가 기반)\n")
         if not self._trades:
             lines.append("- (거래 없음)\n")
         else:
-            lines.append("| 시간 | 그룹 | 종목 | 방향 | 수량 | 가정체결가 | 사유 | 주문번호 | 결과 |\n")
-            lines.append("|---|---|---|---:|---:|---:|---|---|---|\n")
+            lines.append("| 시간 | 그룹 | 종목 | 방향 | 수량 | 가정체결가 | PnL(추정) | 사유 | 주문번호 | 결과 |\n")
+            lines.append("|---|---|---|---:|---:|---:|---:|---|---|---|\n")
             for t in self._trades:
                 ok = "OK" if t.ok else "FAIL"
+                pnl = "" if t.pnl_krw is None else f"{t.pnl_krw:,.0f}"
                 lines.append(
-                    f"| {t.ts} | {t.group} | {t.symbol} | {t.side} | {t.qty} | {t.px_assumed:.2f} | {t.reason} | {t.order_no or ''} | {ok} |\n"
+                    f"| {t.ts} | {t.group} | {t.symbol} | {t.side} | {t.qty} | {t.px_assumed:.2f} | {pnl} | {t.reason} | {t.order_no or ''} | {ok} |\n"
                 )
 
         notes = summary.get("notes") or []
@@ -199,6 +254,48 @@ class ReportManager:
 
         self.report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
+    def build_notification_text(self, *, summary: Dict[str, Any], max_chars: int = 3500) -> str:
+        """OpenClaw systemEvent/메신저로 보내기 좋은 짧은 텍스트를 생성."""
+        date = summary.get("date", "")
+        groups: Dict[str, Any] = summary.get("groups") or {}
+
+        # PnL 추정
+        sells = [t for t in self._trades if t.side.upper() == "SELL" and t.ok]
+        realized = sum([t.pnl_krw for t in sells if t.pnl_krw is not None])
+
+        lines: List[str] = []
+        lines.append(f"[페어봇 리포트] {date}")
+        lines.append(f"- 실현손익(추정): {realized:,.0f} KRW")
+
+        for g, info in groups.items():
+            chosen = info.get("chosen") or "-"
+            target = info.get("target")
+            tstr = "-" if target is None else f"{float(target):.2f}"
+            entered = "Y" if info.get("entered") else "N"
+            decision = (info.get("decision") or "").replace("\n", " ")
+            if len(decision) > 120:
+                decision = decision[:117] + "…"
+            lines.append(f"- {g}: chosen={chosen} target={tstr} entered={entered} / {decision}")
+
+        # 최근 거래 6줄만
+        if self._trades:
+            lines.append("- trades:")
+            for t in self._trades[-6:]:
+                pnl = "" if t.pnl_krw is None else f" pnl={t.pnl_krw:,.0f}"
+                lines.append(f"  - {t.group} {t.side} {t.symbol} x{t.qty} @ {t.px_assumed:.2f}{pnl} ({'OK' if t.ok else 'FAIL'})")
+
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[: max_chars - 20] + "\n...(truncated)"
+        return text
+
     def finalize(self, *, summary: Dict[str, Any]) -> None:
         self._write_trades_csv()
         self.finalize_markdown(summary=summary)
+
+        # notification text도 파일로 남겨두면 디버깅에 좋습니다.
+        try:
+            notify_text = self.build_notification_text(summary=summary)
+            (self.out_dir / "notify.txt").write_text(notify_text + "\n", encoding="utf-8")
+        except Exception:
+            pass

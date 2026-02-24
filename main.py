@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import asyncio
 import logging
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -374,16 +375,36 @@ async def run() -> None:
                 "exit": None,
             }
 
-        report.finalize(
-            summary={
-                "date": now_kst().date().isoformat(),
-                "market_open": True,
-                "universe": {"KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV}, "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV}},
-                "groups": summary_groups,
-                "notes": ["체결가는 주문 직전 관측가격(px)을 가정값으로 기록합니다.", "정확한 정산은 별도 체결조회/증권사 체결내역과 대조하세요."],
-            }
-        )
+        summary = {
+            "date": now_kst().date().isoformat(),
+            "market_open": True,
+            "universe": {"KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV}, "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV}},
+            "groups": summary_groups,
+            "notes": [
+                "체결가는 주문 직전 관측가격(px)을 가정값으로 기록합니다.",
+                "정확한 정산은 별도 체결조회/증권사 체결내역과 대조하세요.",
+            ],
+        }
+
+        report.finalize(summary=summary)
         log.info("report written: %s", report.out_dir)
+
+        # ---- (3) report push: OpenClaw systemEvent (model 0) ----
+        # 사용법:
+        #   REPORT_NOTIFY_OPENCLAW=1
+        #   REPORT_NOTIFY_MAXCHARS=3500
+        if os.getenv("REPORT_NOTIFY_OPENCLAW", "0") == "1":
+            try:
+                text = report.build_notification_text(summary=summary, max_chars=int(os.getenv("REPORT_NOTIFY_MAXCHARS", "3500")))
+                # OpenClaw Gateway가 있는 환경이면 아래 명령으로 현재 채널로 systemEvent를 날릴 수 있습니다.
+                subprocess.run(
+                    ["openclaw", "system", "event", "--text", text, "--mode", "now"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                log.warning("report notify failed: %s", e)
     except Exception as e:
         log.warning("report.finalize failed: %s", e)
 

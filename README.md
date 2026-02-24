@@ -120,14 +120,25 @@ bash scripts/ws_smoke_test.sh
 
 ### 2) 일일 리포트(권장 확인)
 - 경로: `reports/YYYY-MM-DD/`
-  - `report.md` : 사람이 읽는 요약 보고서
+  - `report.md` : 사람이 읽는 요약 보고서(통계 + 그룹별 결과)
   - `events.jsonl` : 결정/진입/청산/에러 타임라인(구조화)
-  - `trades.csv` : 거래 요약(가정 체결가 기반)
+  - `trades.csv` : 거래 요약(가정 체결가 기반, SELL에는 PnL 추정치 포함)
   - `run_meta.json` : 유니버스/설정 메타
+  - `notify.txt` : 메시지 전송용 짧은 요약(생성됨)
 
 > 참고: KIS 주문 API 응답에 체결가가 항상 포함되진 않습니다.
 > `trades.csv`의 가격은 **주문 직전 관측 가격(px) 기준 가정값**일 수 있으니,
 > 정확한 정산은 증권사 체결내역/체결조회와 대조하세요.
+
+### 3) (선택) 장 마감 후 자동 알림(OpenClaw systemEvent)
+
+OpenClaw가 동작하는 환경이라면, 봇 종료 시 **모델 호출 없이(systemEvent)** 텔레그램/채널로 요약 리포트를 푸시할 수 있습니다.
+
+환경변수:
+```env
+REPORT_NOTIFY_OPENCLAW=1
+REPORT_NOTIFY_MAXCHARS=3500
+```
 
 ---
 
