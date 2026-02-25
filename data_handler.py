@@ -93,26 +93,56 @@ class KISDataHandler:
             self.log.warning("OHLCV rows small symbol=%s n=%s", symbol, len(rows))
         return list(reversed(rows))  # old -> new
 
-    def fetch_open_price_0900(self, symbol: str) -> float:
-        """09:00 시가 조회.
+    def fetch_open_price_0900(self, symbol: str, *, retries: int = 12, sleep_sec: float = 0.5) -> float:
+        """09:00 시가 조회(실전 안정형).
 
-        실전에서는 '당일 시가'를 정확히 사용해야 하므로 현재가/시가 API를 호출합니다.
+        문제
+        - 장 시작 직후(09:00:00~)에는 시가 필드가 0 또는 None으로 내려오는 경우가 있습니다.
+        - 기존 구현은 0을 그대로 반환해 모순필터가 "둘 다 MA5 아래"로 판정되며 당일 스킵이 나올 수 있습니다.
 
-        NOTE: TR_ID/키는 환경에 따라 다를 수 있습니다.
+        해결
+        - 짧게 재시도(retries) 후에도 시가가 0이면, 마지막으로 현재가(stck_prpr)를 대체값으로 사용합니다.
+          (정확한 '시가'가 아닐 수 있으나, "0"보다 훨씬 안전하며 실전에서 거래가 멈추는 문제를 방지)
+
+        NOTE
+        - TR_ID/필드명은 KIS 문서/계정 설정에 따라 다를 수 있습니다.
         """
         tr_id = "FHKST01010100"  # 현재가(예시)
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol}
-        resp = requests.get(url, headers=self._auth_headers(tr_id), params=params, timeout=10)
-        resp.raise_for_status()
-        data: Dict[str, Any] = resp.json()
-        out = data.get("output") or {}
-        # 시가는 stck_oprc가 제공되는 경우가 많습니다.
-        v = out.get("stck_oprc") or out.get("open")
-        if v is None:
-            # fallback: 현재가를 시가로 대신하지 않도록 예외
-            raise RuntimeError(f"open price missing for {symbol}: keys={list(out.keys())[:20]}")
-        return float(v)
+
+        last_out: Dict[str, Any] = {}
+        for i in range(max(1, int(retries))):
+            resp = requests.get(url, headers=self._auth_headers(tr_id), params=params, timeout=10)
+            resp.raise_for_status()
+            data: Dict[str, Any] = resp.json()
+            out = data.get("output") or {}
+            last_out = out
+
+            v = out.get("stck_oprc") or out.get("open")
+            try:
+                if v is not None and float(v) > 0:
+                    return float(v)
+            except Exception:
+                pass
+
+            # 잠깐 대기 후 재시도
+            if i < retries - 1:
+                import time
+                time.sleep(float(sleep_sec))
+
+        # 최종 fallback: 현재가로 대체(0 방지)
+        v2 = last_out.get("stck_prpr") or last_out.get("last") or last_out.get("stck_clpr")
+        if v2 is None:
+            raise RuntimeError(f"open price missing for {symbol}: keys={list(last_out.keys())[:20]}")
+        try:
+            if float(v2) <= 0:
+                raise RuntimeError(f"open price invalid/zero for {symbol}: out={ {k:last_out.get(k) for k in ['stck_oprc','stck_prpr','stck_clpr']} }")
+        except Exception as e:
+            raise RuntimeError(f"open price invalid for {symbol}: {e}")
+
+        self.log.warning("open price fallback to stck_prpr for %s (oprc was 0/None)", symbol)
+        return float(v2)
 
     @staticmethod
     def calc_ma5(ohlcv: List[OHLCV]) -> float:

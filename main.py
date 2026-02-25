@@ -183,9 +183,9 @@ async def run() -> None:
 
     log.info("[08:50] refresh done")
 
-    # 09:00 의사결정
-    await sleep_until(dtime(9, 0))
-    log.info("[09:00] decision start")
+    # 09:01 의사결정(장 시작 직후 시가=0 내려오는 케이스 완화)
+    await sleep_until(dtime(9, 1))
+    log.info("[09:01] decision start")
 
     for g in groups.values():
         c = cache[g.name]
