@@ -19,6 +19,7 @@ from __future__ import annotations
 """
 
 import os
+import time
 import asyncio
 import logging
 import subprocess
@@ -270,6 +271,10 @@ async def run() -> None:
 
     log.info("monitor start symbols=%s", symbols)
 
+    # (1) px vs target periodic log
+    pxlog_interval = float(os.getenv("PAIRBOT_PXLOG_INTERVAL_SEC", "30"))
+    _last_pxlog: Dict[str, float] = {g.name: 0.0 for g in groups.values()}
+
     # 실시간 가격 스트림(웹소켓 우선, 실패 시 REST 폴링)
     async for sym, px in execu.price_stream(symbols, poll_interval_sec=poll_interval):
         n = now_kst()
@@ -285,6 +290,16 @@ async def run() -> None:
                 continue
             if g.decision.chosen_symbol != sym:
                 continue
+
+            # (1) 주기 로그: 현재가 vs 목표가
+            try:
+                if pxlog_interval > 0 and (time.time() - _last_pxlog.get(g.name, 0.0)) >= pxlog_interval:
+                    _last_pxlog[g.name] = time.time()
+                    tgt = float(g.decision.target_price)
+                    gap = (tgt / px - 1.0) * 100.0 if px > 0 else float('nan')
+                    log.info("[%s] px=%.2f target=%.2f gap=%.2f%% entered=%s", g.name, px, tgt, gap, g.entered)
+            except Exception:
+                pass
 
             # 진입(09:00~13:00만)
             if (not g.entered) and in_window(n, entry_start, entry_end):

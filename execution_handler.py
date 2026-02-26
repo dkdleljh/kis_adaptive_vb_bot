@@ -22,6 +22,7 @@ import json
 import time
 import asyncio
 import logging
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, AsyncIterator, Tuple
@@ -60,6 +61,30 @@ class ExecutionHandler:
 
         # REST-only fallback polling interval
         self._rest_poll_interval_sec = float(os.getenv("PRICE_POLL_INTERVAL_SEC", "1.0"))
+
+        # (2) price feed error notification (optional, model 0)
+        self._alert_openclaw = os.getenv("PAIRBOT_ALERT_OPENCLAW", "0") == "1"
+        self._alert_cooldown_sec = float(os.getenv("PAIRBOT_ALERT_COOLDOWN_SEC", "600"))
+        self._last_alert_ts = 0.0
+
+    def _notify_openclaw(self, text: str) -> None:
+        if not self._alert_openclaw:
+            return
+        now = time.time()
+        if now - self._last_alert_ts < self._alert_cooldown_sec:
+            return
+        self._last_alert_ts = now
+
+        oc = os.getenv("OPENCLAW_BIN") or "/home/zenith/.nvm/versions/node/v25.4.0/bin/openclaw"
+        try:
+            subprocess.run(
+                [oc, "system", "event", "--text", text, "--mode", "now"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
     # ---------- safety ----------
     def trading_blocked(self) -> Tuple[bool, str]:
@@ -212,5 +237,7 @@ class ExecutionHandler:
                     px = self.rest_get_last_price(sym)
                     yield sym, px
                 except Exception as e:
+                    msg = f"[페어봇] REST price feed error sym={sym}: {type(e).__name__}: {e}"
                     self.log.warning("rest_get_last_price failed sym=%s: %s", sym, e)
+                    self._notify_openclaw(msg)
                 await asyncio.sleep(poll_interval_sec)
