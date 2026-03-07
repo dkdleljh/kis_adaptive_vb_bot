@@ -27,13 +27,11 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, TypedDict, cast
 
 from reporting import ReportManager, TradeRecord
 
-from dotenv import load_dotenv
-
-from data_handler import KISDataHandler
+from data_handler import KISDataHandler, OHLCV
 from strategy_engine import StrategyEngine, GroupDecision
 from risk_manager import RiskManager, Position
 from execution_handler import ExecutionHandler
@@ -60,6 +58,19 @@ class GroupCtx:
     position: Optional[Position] = None
 
 
+class CacheEntry(TypedDict):
+    ohlc_lev: list[OHLCV]
+    ohlc_inv: list[OHLCV]
+    ma5_lev: float
+    ma5_inv: float
+    atr20_lev: float
+    atr20_inv: float
+    noise20_lev: float
+    noise20_inv: float
+    yday_lev: OHLCV
+    yday_inv: OHLCV
+
+
 def now_kst() -> datetime:
     return datetime.now(tz=KST)
 
@@ -70,6 +81,28 @@ def ts(t: dtime) -> dtime:
 
 def in_window(now: datetime, start: dtime, end: dtime) -> bool:
     return ts(start) <= now.timetz() <= ts(end)
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        os.environ[key] = value
 
 
 async def sleep_until(target: dtime) -> None:
@@ -83,7 +116,7 @@ async def sleep_until(target: dtime) -> None:
 async def run() -> None:
     project_root = Path(__file__).resolve().parent
 
-    load_dotenv(project_root / ".env")
+    load_env_file(project_root / ".env")
 
     level = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -111,6 +144,9 @@ async def run() -> None:
     log.propagate = False
 
     capital = float(os.getenv("CAPITAL_KRW", "10000000"))
+    max_position_notional_pct = float(
+        os.getenv("PAIRBOT_MAX_POSITION_NOTIONAL_PCT", "0.5")
+    )
     poll_interval = float(os.getenv("PRICE_POLL_INTERVAL_SEC", "1.0"))
 
     # ---- report manager ----
@@ -122,6 +158,7 @@ async def run() -> None:
         },
         config={
             "capital_krw": capital,
+            "max_position_notional_pct": max_position_notional_pct,
             "poll_interval_sec": poll_interval,
             "log_level": level,
             "live_gate": {
@@ -138,12 +175,17 @@ async def run() -> None:
     if not is_market_open(today):
         msg = f"Market closed today ({today.isoformat()}): {get_holiday_name(today)}. Exiting."
         log.info(msg)
-        report.event("market_closed", date=today.isoformat(), holiday=get_holiday_name(today))
+        report.event(
+            "market_closed", date=today.isoformat(), holiday=get_holiday_name(today)
+        )
         report.finalize(
             summary={
                 "date": today.isoformat(),
                 "market_open": False,
-                "universe": {"KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV}, "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV}},
+                "universe": {
+                    "KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV},
+                    "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV},
+                },
                 "groups": {},
                 "notes": [msg],
             }
@@ -152,7 +194,9 @@ async def run() -> None:
 
     data = KISDataHandler(log)
     strat = StrategyEngine(log)
-    risk = RiskManager(log, capital_krw=capital)
+    risk = RiskManager(
+        log, capital_krw=capital, max_position_notional_pct=max_position_notional_pct
+    )
     execu = ExecutionHandler(log, project_root=project_root)
 
     groups: Dict[str, GroupCtx] = {
@@ -164,7 +208,7 @@ async def run() -> None:
     await sleep_until(dtime(8, 50))
     log.info("[08:50] refresh start")
 
-    cache: Dict[str, dict] = {}
+    cache: Dict[str, CacheEntry] = {}
     for g in groups.values():
         ohlc_lev = data.fetch_daily_ohlcv(g.lev, days=90)
         ohlc_inv = data.fetch_daily_ohlcv(g.inv, days=90)
@@ -199,7 +243,11 @@ async def run() -> None:
         lev_above = open_lev > float(c["ma5_lev"])
         inv_above = open_inv > float(c["ma5_inv"])
         if lev_above == inv_above:
-            g.decision = GroupDecision(False, None, f"SKIP contradiction lev_above={lev_above} inv_above={inv_above}")
+            g.decision = GroupDecision(
+                False,
+                None,
+                f"SKIP contradiction lev_above={lev_above} inv_above={inv_above}",
+            )
             log.info("[%s] %s", g.name, g.decision.reason)
             report.event(
                 "decision_skip",
@@ -215,12 +263,12 @@ async def run() -> None:
         if lev_above:
             atr20 = float(c["atr20_lev"])
             noise = float(c["noise20_lev"])
-            yday = c["yday_lev"]
+            yday = cast(OHLCV, c["yday_lev"])
             open_chosen = float(open_lev)
         else:
             atr20 = float(c["atr20_inv"])
             noise = float(c["noise20_inv"])
-            yday = c["yday_inv"]
+            yday = cast(OHLCV, c["yday_inv"])
             open_chosen = float(open_inv)
 
         decision = strat.decide(
@@ -257,12 +305,66 @@ async def run() -> None:
             log.warning("report.decision failed: %s", e)
 
     # 감시 대상(승인된 종목만)
-    symbols = [g.decision.chosen_symbol for g in groups.values() if g.decision and g.decision.approved and g.decision.chosen_symbol]
+    symbols = [
+        g.decision.chosen_symbol
+        for g in groups.values()
+        if g.decision and g.decision.approved and g.decision.chosen_symbol
+    ]
     symbols = [s for s in symbols if s]
+
+    def finalize_run(summary: Dict[str, Any]) -> None:
+        try:
+            report.finalize(summary=summary)
+            log.info("report written: %s", report.out_dir)
+
+            if os.getenv("REPORT_NOTIFY_OPENCLAW", "0") == "1":
+                text = report.build_notification_text(
+                    summary=summary,
+                    max_chars=int(os.getenv("REPORT_NOTIFY_MAXCHARS", "3500")),
+                )
+                _ = subprocess.run(
+                    ["openclaw", "system", "event", "--text", text, "--mode", "now"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception as e:
+            log.warning("report.finalize failed: %s", e)
 
     if not symbols:
         log.info("No approved symbols today. Will just wait until 15:15 and exit.")
         await sleep_until(dtime(15, 15))
+        summary_groups = {}
+        for g in groups.values():
+            summary_groups[g.name] = {
+                "decision": getattr(g.decision, "reason", None) if g.decision else None,
+                "chosen": getattr(g.decision, "chosen_symbol", None)
+                if g.decision
+                else None,
+                "target": float(getattr(g.decision, "target_price", 0.0))
+                if (
+                    g.decision and getattr(g.decision, "target_price", None) is not None
+                )
+                else None,
+                "entered": bool(g.entered),
+                "exit": None,
+            }
+
+        summary = {
+            "date": now_kst().date().isoformat(),
+            "market_open": True,
+            "universe": {
+                "KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV},
+                "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV},
+            },
+            "groups": summary_groups,
+            "notes": [
+                "No approved symbols today. Stayed flat until force-exit time.",
+                "체결가는 주문 직전 관측가격(px)을 가정값으로 기록합니다.",
+                "정확한 정산은 별도 체결조회/증권사 체결내역과 대조하세요.",
+            ],
+        }
+        finalize_run(summary)
         return
 
     entry_start = dtime(9, 0)
@@ -286,18 +388,32 @@ async def run() -> None:
 
         # 그룹 매핑
         for g in groups.values():
-            if not g.decision or not g.decision.approved or not g.decision.chosen_symbol:
+            if (
+                not g.decision
+                or not g.decision.approved
+                or not g.decision.chosen_symbol
+            ):
                 continue
             if g.decision.chosen_symbol != sym:
                 continue
 
             # (1) 주기 로그: 현재가 vs 목표가
             try:
-                if pxlog_interval > 0 and (time.time() - _last_pxlog.get(g.name, 0.0)) >= pxlog_interval:
+                if (
+                    pxlog_interval > 0
+                    and (time.time() - _last_pxlog.get(g.name, 0.0)) >= pxlog_interval
+                ):
                     _last_pxlog[g.name] = time.time()
                     tgt = float(g.decision.target_price)
-                    gap = (tgt / px - 1.0) * 100.0 if px > 0 else float('nan')
-                    log.info("[%s] px=%.2f target=%.2f gap=%.2f%% entered=%s", g.name, px, tgt, gap, g.entered)
+                    gap = (tgt / px - 1.0) * 100.0 if px > 0 else float("nan")
+                    log.info(
+                        "[%s] px=%.2f target=%.2f gap=%.2f%% entered=%s",
+                        g.name,
+                        px,
+                        tgt,
+                        gap,
+                        g.entered,
+                    )
             except Exception:
                 pass
 
@@ -305,14 +421,22 @@ async def run() -> None:
             if (not g.entered) and in_window(n, entry_start, entry_end):
                 # 목표가 돌파 매수
                 if px >= float(g.decision.target_price):
-                    qty = risk.calc_entry_qty(g.atr20)
+                    qty = risk.calc_entry_qty(atr20=g.atr20, entry_price=px)
                     if qty <= 0:
                         log.warning("[%s] qty=0 skip", g.name)
                         g.entered = True
                         continue
 
                     res = execu.buy_market(sym, qty)
-                    log.info("[%s] BUY %s qty=%s px=%.2f target=%.2f => %s", g.name, sym, qty, px, g.decision.target_price, res)
+                    log.info(
+                        "[%s] BUY %s qty=%s px=%.2f target=%.2f => %s",
+                        g.name,
+                        sym,
+                        qty,
+                        px,
+                        g.decision.target_price,
+                        res,
+                    )
                     report.trade(
                         TradeRecord(
                             ts=now_kst().isoformat(timespec="seconds"),
@@ -329,7 +453,9 @@ async def run() -> None:
                     )
                     if res.ok:
                         g.entered = True
-                        g.position = risk.init_position(symbol=sym, qty=qty, entry_price=px, atr20=g.atr20)
+                        g.position = risk.init_position(
+                            symbol=sym, qty=qty, entry_price=px, atr20=g.atr20
+                        )
                     else:
                         # 주문 실패 시에도 무한 재시도는 위험 -> 해당 그룹은 오늘 종료
                         g.entered = True
@@ -339,7 +465,15 @@ async def run() -> None:
                 g.position = risk.update(g.position, current_price=px, atr20=g.atr20)
                 if px <= g.position.trailing_stop:
                     res = execu.sell_market(sym, g.position.qty)
-                    log.info("[%s] STOP SELL %s qty=%s px=%.2f stop=%.2f => %s", g.name, sym, g.position.qty, px, g.position.trailing_stop, res)
+                    log.info(
+                        "[%s] STOP SELL %s qty=%s px=%.2f stop=%.2f => %s",
+                        g.name,
+                        sym,
+                        g.position.qty,
+                        px,
+                        g.position.trailing_stop,
+                        res,
+                    )
                     report.trade(
                         TradeRecord(
                             ts=now_kst().isoformat(timespec="seconds"),
@@ -361,7 +495,13 @@ async def run() -> None:
     for g in groups.values():
         if g.position:
             res = execu.sell_market(g.position.symbol, g.position.qty)
-            log.info("[%s] FORCE SELL %s qty=%s => %s", g.name, g.position.symbol, g.position.qty, res)
+            log.info(
+                "[%s] FORCE SELL %s qty=%s => %s",
+                g.name,
+                g.position.symbol,
+                g.position.qty,
+                res,
+            )
             report.trade(
                 TradeRecord(
                     ts=now_kst().isoformat(timespec="seconds"),
@@ -379,49 +519,34 @@ async def run() -> None:
             g.position = None
 
     # 리포트 마무리
-    try:
-        summary_groups = {}
-        for g in groups.values():
-            summary_groups[g.name] = {
-                "decision": getattr(g.decision, "reason", None) if g.decision else None,
-                "chosen": getattr(g.decision, "chosen_symbol", None) if g.decision else None,
-                "target": float(getattr(g.decision, "target_price", 0.0)) if (g.decision and getattr(g.decision, "target_price", None) is not None) else None,
-                "entered": bool(g.entered),
-                "exit": None,
-            }
-
-        summary = {
-            "date": now_kst().date().isoformat(),
-            "market_open": True,
-            "universe": {"KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV}, "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV}},
-            "groups": summary_groups,
-            "notes": [
-                "체결가는 주문 직전 관측가격(px)을 가정값으로 기록합니다.",
-                "정확한 정산은 별도 체결조회/증권사 체결내역과 대조하세요.",
-            ],
+    summary_groups = {}
+    for g in groups.values():
+        summary_groups[g.name] = {
+            "decision": getattr(g.decision, "reason", None) if g.decision else None,
+            "chosen": getattr(g.decision, "chosen_symbol", None)
+            if g.decision
+            else None,
+            "target": float(getattr(g.decision, "target_price", 0.0))
+            if (g.decision and getattr(g.decision, "target_price", None) is not None)
+            else None,
+            "entered": bool(g.entered),
+            "exit": None,
         }
 
-        report.finalize(summary=summary)
-        log.info("report written: %s", report.out_dir)
-
-        # ---- (3) report push: OpenClaw systemEvent (model 0) ----
-        # 사용법:
-        #   REPORT_NOTIFY_OPENCLAW=1
-        #   REPORT_NOTIFY_MAXCHARS=3500
-        if os.getenv("REPORT_NOTIFY_OPENCLAW", "0") == "1":
-            try:
-                text = report.build_notification_text(summary=summary, max_chars=int(os.getenv("REPORT_NOTIFY_MAXCHARS", "3500")))
-                # OpenClaw Gateway가 있는 환경이면 아래 명령으로 현재 채널로 systemEvent를 날릴 수 있습니다.
-                subprocess.run(
-                    ["openclaw", "system", "event", "--text", text, "--mode", "now"],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                log.warning("report notify failed: %s", e)
-    except Exception as e:
-        log.warning("report.finalize failed: %s", e)
+    summary = {
+        "date": now_kst().date().isoformat(),
+        "market_open": True,
+        "universe": {
+            "KOSPI": {"lev": KOSPI_LEV, "inv": KOSPI_INV},
+            "KOSDAQ": {"lev": KOSDAQ_LEV, "inv": KOSDAQ_INV},
+        },
+        "groups": summary_groups,
+        "notes": [
+            "체결가는 주문 직전 관측가격(px)을 가정값으로 기록합니다.",
+            "정확한 정산은 별도 체결조회/증권사 체결내역과 대조하세요.",
+        ],
+    }
+    finalize_run(summary)
 
 
 if __name__ == "__main__":

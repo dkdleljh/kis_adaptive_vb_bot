@@ -33,21 +33,44 @@ class Position:
 
 
 class RiskManager:
-    def __init__(self, logger: logging.Logger, *, capital_krw: float) -> None:
+    def __init__(
+        self,
+        logger: logging.Logger,
+        *,
+        capital_krw: float,
+        max_position_notional_pct: float = 0.5,
+    ) -> None:
         self.log = logger
         self.capital = float(capital_krw)
+        self.max_position_notional_pct = max(
+            0.0, min(1.0, float(max_position_notional_pct))
+        )
 
-    def calc_entry_qty(self, atr20: float) -> int:
-        if atr20 <= 0:
+    def calc_entry_qty(self, *, atr20: float, entry_price: float) -> int:
+        if atr20 <= 0 or entry_price <= 0:
             return 0
+
         budget = self.capital * 0.01
-        qty = int(math.floor(budget / atr20))
+        qty_risk = int(math.floor(budget / atr20))
+
+        max_notional = self.capital * self.max_position_notional_pct
+        qty_notional = int(math.floor(max_notional / entry_price))
+
+        qty = min(qty_risk, qty_notional)
         return max(0, qty)
 
-    def init_position(self, *, symbol: str, qty: int, entry_price: float, atr20: float) -> Position:
+    def init_position(
+        self, *, symbol: str, qty: int, entry_price: float, atr20: float
+    ) -> Position:
         highest = float(entry_price)
         stop = float(highest - atr20 * 1.5)
-        return Position(symbol=symbol, qty=qty, entry_price=float(entry_price), highest_price=highest, trailing_stop=stop)
+        return Position(
+            symbol=symbol,
+            qty=qty,
+            entry_price=float(entry_price),
+            highest_price=highest,
+            trailing_stop=stop,
+        )
 
     def update(self, pos: Position, *, current_price: float, atr20: float) -> Position:
         highest = max(pos.highest_price, float(current_price))
