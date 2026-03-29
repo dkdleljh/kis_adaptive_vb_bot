@@ -1,24 +1,43 @@
-# 페어봇 (PairBot) — KIS Adaptive Volatility Breakout (KR ETF Pair)
+# KIS Adaptive VB Bot
 
-KIS OpenAPI로 **KODEX ETF 4종목**을 대상으로
-"적응형 변동성 돌파(Adaptive Volatility Breakout)"를 실행하는 자동매매 봇입니다.
+`kis_adaptive_vb_bot`은 한국투자증권 KIS OpenAPI를 이용해 국내 ETF 4종을 대상으로 적응형 변동성 돌파 전략을 자동으로 실행하는 프로젝트다. 단순히 주문만 보내는 스크립트가 아니라, 장 시작 전 준비, 진입 판단, 리스크 제한, 장중 추적, 장 마감 청산, 일일 리포트 생성까지 하나의 운영 흐름으로 묶어 둔 것이 특징이다.
 
-- 유니버스(고정)
-  - KOSPI: 122630(레버) vs 252670(인버스2X)
-  - KOSDAQ: 233740(코스닥150레버) vs 251340(코스닥150인버스)
+## 프로젝트 개요
 
-> ⚠️ 면책
-> - 투자 조언이 아닙니다. 손실 책임은 사용자에게 있습니다.
-> - 실거래 전 모의/소액으로 충분히 검증하세요.
+- 전략 이름: Adaptive Volatility Breakout
+- 시장: 한국 ETF
+- 유니버스:
+  - KOSPI 그룹: `122630` KODEX 레버리지, `252670` KODEX 200선물인버스2X
+  - KOSDAQ 그룹: `233740` KODEX 코스닥150레버리지, `251340` KODEX 코스닥150선물인버스
+- 기본 원칙:
+  - 같은 그룹 안에서 레버리지와 인버스 중 한 방향만 선택
+  - ATR20과 Noise20 기반으로 목표가를 계산
+  - 장중 돌파 시 1회 진입
+  - 트레일링 스탑과 15:15 강제 청산으로 오버나잇을 금지
 
----
+## 전략 요약
 
-## 문서
-- **사용설명서(초보자용)**: `사용설명서.md`
+이 봇은 오전 9시 전후에 각 그룹의 방향을 먼저 판단한 뒤, 승인된 방향의 종목만 감시한다. 목표가를 돌파하면 진입하고, 이후에는 샹들리에 방식의 트레일링 스탑으로 이익을 보호한다. 장이 끝날 때까지 포지션이 남아 있으면 15시 15분에 무조건 전량 청산한다.
 
----
+핵심 판단 로직은 다음과 같다.
 
-## 빠른 시작(3분)
+- 방향 선택: 09:00 시가 기준으로 레버리지와 인버스 중 하나만 MA5 위에 있을 때만 승인
+- 진입 시점: 09:00부터 13:00 사이 목표가 돌파 시
+- 수량 계산: 총자본 1% 리스크 기준과 종목별 명목 비중 한도를 함께 적용
+- 청산: 트레일링 스탑 또는 15:15 타임아웃 청산
+
+## 안전장치
+
+실제 주문은 아래 조건이 모두 맞을 때만 전송된다.
+
+- `.env`에서 `KIS_LIVE_ENABLED=1`
+- `.env`에서 `KIS_LIVE_CONFIRM=YES`
+- `.env`에서 `KIS_KILL_SWITCH=0`
+- 프로젝트 루트에 `STOP_TRADING.flag`가 없어야 함
+
+즉, 실행 중이라고 해서 곧바로 실거래가 나가는 구조가 아니다. 실전 환경에서는 먼저 `STOP_TRADING.flag`를 켠 상태로 로그와 리포트만 점검한 뒤, 최종 확인 후 해제하는 흐름을 권장한다.
+
+## 빠른 시작
 
 ```bash
 cd ~/Desktop/kis_adaptive_vb_bot
@@ -28,132 +47,77 @@ nano .env
 bash scripts/run_bot.sh
 ```
 
-로그:
-```bash
-tail -n 200 logs/nohup_adaptive_vb.log
-```
+중지는 아래와 같이 할 수 있다.
 
-중지:
 ```bash
 bash scripts/stop_bot.sh
 ```
 
----
+## 주요 환경 변수
 
-## 매매 전략(요약)
+가장 중요한 값만 먼저 정리하면 아래와 같다.
 
-페어봇은 KOSPI/KOSDAQ 각각에 대해 **레버리지 vs 인버스 중 하나만 선택해 매수**하는
-"적응형 변동성 돌파(Adaptive Volatility Breakout)" 전략입니다.
+```env
+KIS_APP_KEY=...
+KIS_APP_SECRET=...
+KIS_ACCOUNT_NO=12345678
+KIS_ACCOUNT_PRODUCT_CODE=01
 
-### 1) 방향 선택(모순 필터)
-- 09:00 시가 기준으로, 같은 그룹 내 레버/인버스 중
-  - **오직 하나만** MA5 위에 있을 때만 거래(방향 확정)
-  - 둘 다 위/둘 다 아래면 그 그룹은 당일 스킵
+KIS_LIVE_ENABLED=0
+KIS_LIVE_CONFIRM=NO
+KIS_KILL_SWITCH=1
 
-### 2) 동적 K와 목표가(Target)
-- 지표:
-  - ATR20 (20일 평균 변동성)
-  - Noise20avg = 평균( 1 - |C-O|/(H-L) )
-- 동적 K:
-  - **K = Noise20avg × (전일 고저폭 / ATR20)**
-- 목표가:
-  - **Target = 시가 + (전일 고저폭 × K)**
-
-### 3) 진입/청산 규칙
-- **진입(09:00~13:00)**: 현재가 ≥ Target이면 시장가 매수(그룹당 1회)
-- **수량 제한**: `min(리스크기반수량, 포지션명목한도수량)`
-  - 리스크기반수량 = `floor((총자본×1%) / ATR20)`
-  - 포지션명목한도수량 = `floor((총자본×PAIRBOT_MAX_POSITION_NOTIONAL_PCT) / 진입가)`
-- **트레일링 스탑**(샹들리에): 최고가 - ATR20×1.5
-- **강제 청산(15:15)**: 오버나잇 금지, 전량 시장가 매도
-
----
-
-## 실전 주문 안전장치(중요)
-
-주문이 나가려면 아래가 **모두** 필요합니다.
-
-- `.env`:
-  - `KIS_LIVE_ENABLED=1`
-  - `KIS_LIVE_CONFIRM=YES`
-  - `KIS_KILL_SWITCH=0`
-- 그리고 `STOP_TRADING.flag` 파일이 **없어야** 합니다.
-
-주문 차단(권장):
-```bash
-touch STOP_TRADING.flag
+CAPITAL_KRW=10000000
+PAIRBOT_MAX_POSITION_NOTIONAL_PCT=0.5
+PRICE_POLL_INTERVAL_SEC=1.0
+LOG_LEVEL=INFO
 ```
 
----
+실전 웹소켓을 쓰려면 아래 값도 함께 설정한다.
 
-## 운영 타임테이블(KST)
-
-- 08:50 데이터 갱신(일봉/지표)
-- 09:00 모순 필터 + 목표가 산출
-- 09:00~13:00 목표가 돌파 1회 진입
-- 진입 후 트레일링 스탑 감시
-- 15:15 전량 강제청산
-- 승인 종목이 0개인 날도 마감 리포트(`reports/YYYY-MM-DD/`)는 항상 생성
-
----
-
-## WebSocket(선택)
-
-실전 WS 도메인(문서 H0STCNT0 기준):
-- `ws://ops.koreainvestment.com:21000`
-
-환경변수:
 ```env
 KIS_WS_URL=ws://ops.koreainvestment.com:21000
 ```
 
-점검:
-```bash
-bash scripts/ws_smoke_test.sh
-```
+## 실행 결과 확인
 
----
+운영 중에 가장 자주 보게 되는 위치는 아래 세 군데다.
 
-## 로그 / 리포트 / 보고서 (운영 친화)
+- `logs/`
+  - 날짜별 실행 로그와 `nohup` 로그
+- `reports/YYYY-MM-DD/`
+  - `report.md`: 사람이 읽기 쉬운 일일 요약
+  - `events.jsonl`: 구조화된 이벤트 타임라인
+  - `trades.csv`: 주문/체결 추정 이력
+  - `run_meta.json`: 실행 시점 설정과 유니버스 정보
+- 루트 스크립트
+  - `scripts/run_bot.sh`, `scripts/stop_bot.sh`, `scripts/ws_smoke_test.sh`
 
-페어봇은 "돌아갔는지"를 **로그만 보고 추측**하지 않도록, 실행 결과를 별도 리포트로 남깁니다.
+## 디렉터리 안내
 
-### 1) 실행 로그
-- 콘솔(stdout) + 파일 동시 기록
-- 파일 경로: `logs/pairbot_YYYY-MM-DD.log`
+- [main.py](/home/zenith/Desktop/kis_adaptive_vb_bot/main.py): 장중 실행을 조율하는 메인 오케스트레이터
+- [data_handler.py](/home/zenith/Desktop/kis_adaptive_vb_bot/data_handler.py): 일봉, MA, ATR, Noise 계산
+- [strategy_engine.py](/home/zenith/Desktop/kis_adaptive_vb_bot/strategy_engine.py): 방향 선택과 목표가 계산
+- [risk_manager.py](/home/zenith/Desktop/kis_adaptive_vb_bot/risk_manager.py): 수량 계산과 트레일링 스탑
+- [execution_handler.py](/home/zenith/Desktop/kis_adaptive_vb_bot/execution_handler.py): 주문 전송과 시세 조회
+- [reporting.py](/home/zenith/Desktop/kis_adaptive_vb_bot/reporting.py): 일일 리포트 생성
+- [사용설명서.md](/home/zenith/Desktop/kis_adaptive_vb_bot/사용설명서.md): 설치, 운영, 문제 해결 중심 안내서
 
-### 2) 일일 리포트(권장 확인)
-- 경로: `reports/YYYY-MM-DD/`
-  - `report.md` : 사람이 읽는 요약 보고서(통계 + 그룹별 결과)
-  - `events.jsonl` : 결정/진입/청산/에러 타임라인(구조화)
-  - `trades.csv` : 거래 요약(가정 체결가 기반, SELL에는 PnL 추정치 포함)
-  - `run_meta.json` : 유니버스/설정 메타
-  - `notify.txt` : 메시지 전송용 짧은 요약(생성됨)
+## 운영 타임라인
 
-> 참고: KIS 주문 API 응답에 체결가가 항상 포함되진 않습니다.
-> `trades.csv`의 가격은 **주문 직전 관측 가격(px) 기준 가정값**일 수 있으니,
-> 정확한 정산은 증권사 체결내역/체결조회와 대조하세요.
+- 08:50: 일봉 및 지표 갱신
+- 09:01: 그룹별 방향 결정
+- 09:00~13:00: 목표가 돌파 감시 및 진입
+- 진입 후: 트레일링 스탑 감시
+- 15:15: 전량 강제 청산
+- 마감 후: 리포트 생성 및 선택적 알림 전송
 
-### 3) (선택) 장 마감 후 자동 알림(OpenClaw systemEvent)
+## 리포트와 해석 주의
 
-OpenClaw가 동작하는 환경이라면, 봇 종료 시 **모델 호출 없이(systemEvent)** 텔레그램/채널로 요약 리포트를 푸시할 수 있습니다.
+`trades.csv`에는 주문 API 응답 한계 때문에 실제 체결가가 아니라 주문 직전 관측 가격이 들어갈 수 있다. 따라서 손익 열은 운영 참고용 추정치로 보고, 최종 정산은 증권사 체결 내역과 반드시 대조해야 한다.
 
-환경변수:
-```env
-REPORT_NOTIFY_OPENCLAW=1
-REPORT_NOTIFY_MAXCHARS=3500
-```
+## 공개 저장소 운영 원칙
 
----
-
-## 폴더 구조
-
-- `main.py` : 스케줄/오케스트레이션
-- `data_handler.py` : 일봉/시가/지표 계산
-- `strategy_engine.py` : 모순 필터 + 동적 K + 목표가
-- `risk_manager.py` : 1% 리스크 수량 + 트레일링 스탑
-- `execution_handler.py` : 주문/시세(WS→REST 폴백)
-- `kis_auth.py` : tokenP/Approval/hashkey + 레이트리밋/backoff
-- `kis_ws_marketdata.py` : WS 메시지 파싱(체결가)
-- `utils_holiday.py` : 주말/휴장일 스킵
-- `scripts/` : bootstrap/run/stop/ws_smoke
+- `.env`, 토큰 캐시, 로그, PID 파일은 Git에 올리지 않는다.
+- 샘플 리포트는 문서 예시로 포함할 수 있지만, 실계좌 식별 정보는 제거한 상태만 허용한다.
+- 실전 사용 전에는 모의 환경 또는 소액 환경에서 충분히 검증하는 것이 좋다.

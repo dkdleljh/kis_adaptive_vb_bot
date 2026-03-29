@@ -1,0 +1,4 @@
+[페어봇 리포트] 2026-02-25
+- 실현손익(추정): 0 KRW
+- KOSPI: chosen=122630 target=106359.93 entered=N / APPROVED
+- KOSDAQ: chosen=233740 target=19240.03 entered=N / APPROVED

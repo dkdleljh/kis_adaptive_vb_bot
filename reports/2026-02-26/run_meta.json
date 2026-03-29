@@ -1,0 +1,25 @@
+{
+  "generated_at": "2026-02-26T09:16:40+09:00",
+  "timezone": "Asia/Seoul",
+  "universe": {
+    "KOSPI": {
+      "lev": "122630",
+      "inv": "252670"
+    },
+    "KOSDAQ": {
+      "lev": "233740",
+      "inv": "251340"
+    }
+  },
+  "config": {
+    "capital_krw": 10000000.0,
+    "poll_interval_sec": 1.0,
+    "log_level": "INFO",
+    "live_gate": {
+      "KIS_LIVE_ENABLED": "1",
+      "KIS_LIVE_CONFIRM": "YES",
+      "KIS_KILL_SWITCH": "0",
+      "stop_flag": "False"
+    }
+  }
+}
